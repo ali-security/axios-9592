@@ -22,7 +22,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repo
@@ -70,10 +70,10 @@ jobs:
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v8
         with:
-          branch: "release"
-          commit-message: "chore(release): prepare release ${{ steps.bump-version.outputs.newTag }}"
-          body: "This PR prepares the release ${{ steps.bump-version.outputs.newTag }}."
-          title: "chore(release): prepare release ${{ steps.bump-version.outputs.newTag }}"
+          branch: release
+          commit-message: 'chore(release): prepare release ${{ steps.bump-version.outputs.newTag }}'
+          body: This PR prepares the release ${{ steps.bump-version.outputs.newTag }}.
+          title: 'chore(release): prepare release ${{ steps.bump-version.outputs.newTag }}'
           maintainer-can-modify: true
           draft: false
           labels: |
