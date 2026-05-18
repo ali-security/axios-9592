@@ -148,6 +148,26 @@ describe('supports http with nodejs', function () {
     });
   });
 
+  it('should sanitize request headers containing CRLF characters', async function () {
+    this.timeout(10000);
+    const server = await startHTTPServer(
+      (req, res) => {
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ xTest: req.headers['x-test'], injected: req.headers.injected ?? null }));
+      },
+      { port: SERVER_PORT }
+    );
+    try {
+      const { data } = await axios.get(`http://localhost:${server.address().port}/`, {
+        headers: { 'x-test': '\tok\r\nInjected: yes ' },
+      });
+      assert.strictEqual(data.xTest, 'okInjected: yes');
+      assert.strictEqual(data.injected, null);
+    } finally {
+      await stopHTTPServer(server);
+    }
+  });
+
   it('should parse the timeout property', function (done) {
 
     server = http.createServer(function (req, res) {
@@ -774,6 +794,140 @@ describe('supports http with nodejs', function () {
     });
   });
 
+  it('should enforce maxContentLength for streamed responses (GHSA-vf2m-468p-8v99)', async function () {
+    this.timeout(10000);
+    const size = 2 * 1024 * 1024;
+    const body = Buffer.alloc(size, 0x63);
+    const server = await startHTTPServer(
+      (req, res) => {
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.end(body);
+      },
+      { port: SERVER_PORT }
+    );
+
+    try {
+      const response = await axios.get(`http://localhost:${server.address().port}/`, {
+        responseType: 'stream',
+        maxContentLength: 1024,
+      });
+
+      let bytesRead = 0;
+      const err = await new Promise((resolve) => {
+        response.data.on('data', (chunk) => { bytesRead += chunk.length; });
+        response.data.on('error', resolve);
+        response.data.on('end', () => resolve(null));
+      });
+
+      assert.ok(err, 'stream should emit an error');
+      assert.strictEqual(err.message, 'maxContentLength size of 1024 exceeded');
+      assert.ok(bytesRead <= 1024 * 64, `stream should not deliver full payload; got ${bytesRead}`);
+    } finally {
+      await stopHTTPServer(server);
+    }
+  });
+
+  it('should allow streamed responses under maxContentLength', async function () {
+    this.timeout(10000);
+    const body = Buffer.alloc(512, 0x64);
+    const server = await startHTTPServer(
+      (req, res) => {
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.end(body);
+      },
+      { port: SERVER_PORT }
+    );
+
+    try {
+      const response = await axios.get(`http://localhost:${server.address().port}/`, {
+        responseType: 'stream',
+        maxContentLength: 1024,
+      });
+
+      const chunks = [];
+      await new Promise((resolve, reject) => {
+        response.data.on('data', (chunk) => chunks.push(chunk));
+        response.data.on('error', reject);
+        response.data.on('end', resolve);
+      });
+
+      assert.strictEqual(Buffer.concat(chunks).length, body.length);
+    } finally {
+      await stopHTTPServer(server);
+    }
+  });
+
+  it('should enforce maxBodyLength for streamed uploads with maxRedirects: 0 (GHSA-5c9x-8gcm-mpgx)', async function () {
+    this.timeout(10000);
+    let bytesReceived = 0;
+    const server = await startHTTPServer(
+      (req, res) => {
+        req.on('data', (chunk) => { bytesReceived += chunk.length; });
+        req.on('end', () => {
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ received: bytesReceived }));
+        });
+      },
+      { port: SERVER_PORT }
+    );
+
+    try {
+      const size = 2 * 1024 * 1024;
+      const buf = Buffer.alloc(size, 0x61);
+      const source = stream.Readable.from([buf]);
+
+      await assert.rejects(
+        axios.post(`http://localhost:${server.address().port}/`, source, {
+          maxBodyLength: 1024,
+          maxRedirects: 0,
+          headers: { 'Content-Type': 'application/octet-stream' },
+        }),
+        (error) => {
+          assert.strictEqual(error.message, 'Request body larger than maxBodyLength limit');
+          return true;
+        }
+      );
+
+      assert.ok(bytesReceived <= 1024 * 4, `server should not receive full payload; got ${bytesReceived}`);
+    } finally {
+      await stopHTTPServer(server);
+    }
+  });
+
+  it('should allow streamed uploads under maxBodyLength with maxRedirects: 0', async function () {
+    this.timeout(10000);
+    let bytesReceived = 0;
+    const server = await startHTTPServer(
+      (req, res) => {
+        req.on('data', (chunk) => { bytesReceived += chunk.length; });
+        req.on('end', () => {
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ received: bytesReceived }));
+        });
+      },
+      { port: SERVER_PORT }
+    );
+
+    try {
+      const payload = Buffer.alloc(512, 0x62);
+      const source = stream.Readable.from([payload]);
+
+      const response = await axios.post(
+        `http://localhost:${server.address().port}/`,
+        source,
+        {
+          maxBodyLength: 1024,
+          maxRedirects: 0,
+          headers: { 'Content-Type': 'application/octet-stream' },
+        }
+      );
+
+      assert.strictEqual(response.data.received, payload.length);
+    } finally {
+      await stopHTTPServer(server);
+    }
+  });
+
   it('should properly support default max body length (follow-redirects as well)', function (done) {
     // taken from https://github.com/follow-redirects/follow-redirects/blob/22e81fc37132941fb83939d1dc4c2282b5c69521/index.js#L461
     var followRedirectsMaxBodyDefaults = 10 * 1024 *1024;
@@ -1197,6 +1351,76 @@ describe('supports http with nodejs', function () {
         }).catch(done);
       });
     });
+  });
+
+  it('should not use proxy for localhost with trailing dot when listed in no_proxy', async function () {
+    this.timeout(10000);
+    const originalHttpProxy = process.env.http_proxy;
+    const originalHTTPProxy = process.env.HTTP_PROXY;
+    const originalNoProxy = process.env.no_proxy;
+    const originalNOProxy = process.env.NO_PROXY;
+
+    let proxyRequests = 0;
+    const proxyServer = await startHTTPServer(
+      (_, response) => {
+        proxyRequests += 1;
+        response.end('proxied');
+      },
+      { port: 4447 }
+    );
+
+    const noProxyValue = 'localhost,127.0.0.1,::1';
+    const proxyUrl = `http://localhost:${proxyServer.address().port}/`;
+    process.env.http_proxy = proxyUrl;
+    process.env.HTTP_PROXY = proxyUrl;
+    process.env.no_proxy = noProxyValue;
+    process.env.NO_PROXY = noProxyValue;
+
+    try {
+      await assert.rejects(axios.get('http://localhost.:1/', { timeout: 100 }));
+      assert.equal(proxyRequests, 0, 'should not use proxy for localhost with trailing dot');
+    } finally {
+      await stopHTTPServer(proxyServer);
+      process.env.http_proxy = originalHttpProxy || '';
+      process.env.HTTP_PROXY = originalHTTPProxy || '';
+      process.env.no_proxy = originalNoProxy || '';
+      process.env.NO_PROXY = originalNOProxy || '';
+    }
+  });
+
+  it('should not use proxy for bracketed IPv6 loopback when listed in no_proxy', async function () {
+    this.timeout(10000);
+    const originalHttpProxy = process.env.http_proxy;
+    const originalHTTPProxy = process.env.HTTP_PROXY;
+    const originalNoProxy = process.env.no_proxy;
+    const originalNOProxy = process.env.NO_PROXY;
+
+    let proxyRequests = 0;
+    const proxyServer = await startHTTPServer(
+      (_, response) => {
+        proxyRequests += 1;
+        response.end('proxied');
+      },
+      { port: 4447 }
+    );
+
+    const noProxyValue = 'localhost,127.0.0.1,::1';
+    const proxyUrl = `http://localhost:${proxyServer.address().port}/`;
+    process.env.http_proxy = proxyUrl;
+    process.env.HTTP_PROXY = proxyUrl;
+    process.env.no_proxy = noProxyValue;
+    process.env.NO_PROXY = noProxyValue;
+
+    try {
+      await assert.rejects(axios.get('http://[::1]:1/', { timeout: 100 }));
+      assert.equal(proxyRequests, 0, 'should not use proxy for IPv6 loopback');
+    } finally {
+      await stopHTTPServer(proxyServer);
+      process.env.http_proxy = originalHttpProxy || '';
+      process.env.HTTP_PROXY = originalHTTPProxy || '';
+      process.env.no_proxy = originalNoProxy || '';
+      process.env.NO_PROXY = originalNOProxy || '';
+    }
   });
 
   it('should use proxy for domains not in no_proxy', function (done) {
@@ -1716,7 +1940,57 @@ describe('supports http with nodejs', function () {
       });
     });
 
-    describe('toFormData helper', function () {
+    describe('prototype pollution (GHSA-6chq-wfr3-2hj9)', function () {
+    const pollutedKeys = ['getHeaders', 'append', 'pipe', 'on', 'once'];
+    const toStringTagSym = Symbol.toStringTag;
+
+    function pollute() {
+      Object.prototype[toStringTagSym] = 'FormData';
+      Object.prototype.append = () => {};
+      Object.prototype.getHeaders = () => ({
+        'x-injected': 'attacker',
+        'authorization': 'Bearer ATTACKER_TOKEN',
+      });
+      Object.prototype.pipe = function (d) { if (d && d.end) d.end(); return d; };
+      Object.prototype.on = function () { return this; };
+      Object.prototype.once = function () { return this; };
+    }
+
+    function cleanup() {
+      for (const k of pollutedKeys) delete Object.prototype[k];
+      delete Object.prototype[toStringTagSym];
+    }
+
+    it('should not merge prototype-polluted getHeaders into outgoing request', async function () {
+      this.timeout(10000);
+      let receivedHeaders;
+      const server = await startHTTPServer(
+        (req, res) => {
+          receivedHeaders = req.headers;
+          res.end('{}');
+        },
+        { port: SERVER_PORT }
+      );
+
+      try {
+        pollute();
+        await axios.post(
+          `http://localhost:${server.address().port}/`,
+          { userId: 42 },
+          { headers: { 'Authorization': 'Bearer VALID_USER_TOKEN' } }
+        );
+      } finally {
+        cleanup();
+        await stopHTTPServer(server);
+      }
+
+      assert.ok(receivedHeaders, 'request did not reach server');
+      assert.strictEqual(receivedHeaders['x-injected'], undefined);
+      assert.notStrictEqual(receivedHeaders['authorization'], 'Bearer ATTACKER_TOKEN');
+    });
+  });
+
+  describe('toFormData helper', function () {
       it('should properly serialize nested objects for parsing with multer.js (express.js)', function (done) {
         var app = express();
 
